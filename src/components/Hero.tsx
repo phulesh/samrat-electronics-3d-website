@@ -46,7 +46,11 @@ export default function Hero({ reducedMotion = false }: HeroProps) {
       {/* Content */}
       <div className="container-x relative z-10 flex flex-1 flex-col justify-end px-5 pb-24 pt-32 sm:px-8 md:justify-center md:pb-32 lg:px-14">
         <div className="max-w-3xl">
-          <p className="kicker animate-[fade-in_0.8s_ease]">
+          <p className="animate-[fade-in_0.7s_ease] font-display text-xs font-extrabold uppercase tracking-[0.34em] text-white/90 sm:text-sm">
+            Samrat Electronics <span className="mx-2 text-cyan-400">·</span>
+            <span className="text-cyan-300"> HVAC Solutions</span>
+          </p>
+          <p className="kicker mt-4 animate-[fade-in_0.8s_ease]">
             <span className="relative flex h-2 w-2">
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-75" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-400" />
