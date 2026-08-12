@@ -29,6 +29,7 @@ export default function SearchPage() {
   const filters = useAppStore((s) => s.filters);
   const setFilters = useAppStore((s) => s.setFilters);
   const saveLead = useAppStore((s) => s.saveLead);
+  const verifyLink = useAppStore((s) => s.verifyLink);
   const saveSearch = useAppStore((s) => s.saveSearch);
   const query = useAppStore((s) => s.query);
 
@@ -109,7 +110,7 @@ export default function SearchPage() {
       <div className="mb-4 flex flex-wrap gap-2 text-[11px] text-[var(--muted)]">
         {sources.map((s) => (
           <span key={s.id} className={s.ok ? "text-mint-400" : "text-rose-300"}>
-            {s.name}: {s.ok ? `${s.count}` : s.message}
+            {s.name}: {s.ok ? `${s.verifiedCount ?? 0}/${s.count} verified` : s.message}
           </span>
         ))}
       </div>
@@ -146,6 +147,10 @@ export default function SearchPage() {
           onClose={() => setOpen(undefined)}
           onSave={() => saveLead(open)}
           onPropose={() => setProp(open)}
+          onVerify={async () => {
+            const updated = await verifyLink(open);
+            setOpen(updated);
+          }}
         />
       )}
       {prop && <ProposalModal item={prop} onClose={() => setProp(undefined)} />}

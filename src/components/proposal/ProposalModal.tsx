@@ -64,7 +64,9 @@ export function ProposalModal({
             variant="gold"
             className="flex-1"
             onClick={() => {
-              const id = leadId || saveLead(item).id;
+              const lead = leadId ? undefined : saveLead(item);
+              const id = leadId || lead?.id;
+              if (!id) return;
               generateFor(item, tone, id);
               onClose();
             }}
