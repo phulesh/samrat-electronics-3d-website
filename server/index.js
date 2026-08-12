@@ -1,9 +1,21 @@
 import express from "express";
 import cors from "cors";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.API_PORT || 3001);
 const CACHE_MS = 8 * 60 * 1000;
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const VERIFY_TIMEOUT_MS = 7000;
+const MAX_VERIFIED_RESULTS = 60;
 const cache = new Map();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const VERIFICATION_DB_PATH = path.join(__dirname, "verification-db.json");
+let verificationDb = {};
+let verificationDbLoaded = false;
+let verificationDbWrite = Promise.resolve();
 
 const SOURCES = [
   {
@@ -11,36 +23,42 @@ const SOURCES = [
     name: "RemoteOK",
     url: "https://remoteok.com/api",
     homepage: "https://remoteok.com",
+    allowedHosts: ["remoteok.com", "www.remoteok.com"],
   },
   {
     id: "remotive",
     name: "Remotive",
     url: "https://remotive.com/api/remote-jobs",
     homepage: "https://remotive.com",
+    allowedHosts: ["remotive.com", "www.remotive.com"],
   },
   {
     id: "arbeitnow",
     name: "Arbeitnow",
     url: "https://www.arbeitnow.com/api/job-board-api",
     homepage: "https://www.arbeitnow.com",
+    allowedHosts: ["arbeitnow.com", "www.arbeitnow.com"],
   },
   {
     id: "jobicy",
     name: "Jobicy",
     url: "https://jobicy.com/api/v2/remote-jobs",
     homepage: "https://jobicy.com",
+    allowedHosts: ["jobicy.com", "www.jobicy.com"],
   },
   {
     id: "himalayas",
     name: "Himalayas",
     url: "https://himalayas.app/jobs/api?limit=80",
     homepage: "https://himalayas.app",
+    allowedHosts: ["himalayas.app", "www.himalayas.app"],
   },
   {
     id: "hn",
     name: "Hacker News (Algolia)",
     url: "https://hn.algolia.com/api/v1/search_by_date",
     homepage: "https://news.ycombinator.com",
+    allowedHosts: ["news.ycombinator.com", "www.news.ycombinator.com"],
   },
 ];
 
@@ -124,8 +142,221 @@ async function fetchJson(url, timeoutMs = 9000, headers = {}) {
   }
 }
 
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return ["http:", "https:"].includes(url.protocol) ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function samePlatformHost(url, source) {
+  const parsed = isHttpUrl(url);
+  if (!parsed || !source) return false;
+  return source.allowedHosts.some((host) => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`));
+}
+
+function sourceForOpportunity(opp = {}) {
+  return SOURCES.find((s) => s.id === opp.sourceId || s.name === opp.sourceName || s.name.replace(/ \(.+\)/, "") === opp.sourceName);
+}
+
+function verificationFields(status = "UNVERIFIED", verifiedUrl = "", verifiedAt = "") {
+  return {
+    verifiedUrl,
+    isVerified: status === "VERIFIED",
+    verifiedAt,
+    verificationStatus: status,
+  };
+}
+
+async function loadVerificationDb() {
+  if (verificationDbLoaded) return verificationDb;
+  try {
+    const raw = await fs.readFile(VERIFICATION_DB_PATH, "utf8");
+    verificationDb = JSON.parse(raw);
+  } catch {
+    verificationDb = {};
+  }
+  verificationDbLoaded = true;
+  return verificationDb;
+}
+
+async function saveVerificationDb() {
+  await fs.mkdir(path.dirname(VERIFICATION_DB_PATH), { recursive: true });
+  verificationDbWrite = verificationDbWrite.then(() =>
+    fs.writeFile(VERIFICATION_DB_PATH, JSON.stringify(verificationDb, null, 2), "utf8"),
+  );
+  return verificationDbWrite;
+}
+
+function dbKey(opp) {
+  return `${opp.sourceName || "unknown"}:${opp.id || opp.projectUrl || opp.applicationUrl || opp.sourceUrl}`;
+}
+
+function meaningfulTokens(text = "") {
+  return String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 4 && !["remote", "jobs", "developer", "engineer", "with", "from", "that"].includes(t))
+    .slice(0, 10);
+}
+
+function confirmsOpportunity(pageText, url, opp) {
+  const clean = stripHtml(pageText).toLowerCase();
+  const titleTokens = meaningfulTokens(opp.title);
+  const companyTokens = meaningfulTokens(opp.company);
+  const urlText = String(url || "").toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  const titleHits = titleTokens.filter((t) => clean.includes(t)).length;
+  const companyHit = companyTokens.some((t) => clean.includes(t));
+  const urlTitleHits = titleTokens.filter((t) => urlText.includes(t)).length;
+
+  if (titleTokens.length === 0) return clean.length > 0;
+  if (titleHits >= Math.min(2, titleTokens.length)) return true;
+  if (titleHits >= 1 && companyHit) return true;
+  if (urlTitleHits >= Math.min(2, titleTokens.length) && clean.length > 100) return true;
+  return false;
+}
+
+async function fetchTextForVerification(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), VERIFY_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: ctrl.signal,
+      headers: {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+        "User-Agent": "ClientFinderAI-LinkVerifier/1.0 (verified original link checker)",
+      },
+    });
+    if (!res.ok) return { ok: false, status: `HTTP ${res.status}` };
+    const contentType = res.headers.get("content-type") || "";
+    const text = await res.text();
+    return { ok: true, status: "Reachable", text: text.slice(0, 180000), contentType, finalUrl: res.url };
+  } catch (err) {
+    return { ok: false, status: err?.name === "AbortError" ? "Timed out" : err?.message || "Unavailable" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyOpportunityLink(opp, options = {}) {
+  await loadVerificationDb();
+  const source = sourceForOpportunity(opp);
+  const key = dbKey(opp);
+  const existing = verificationDb[key];
+  if (!options.force && existing?.verifiedAt && Date.now() - new Date(existing.verifiedAt).getTime() < VERIFICATION_TTL_MS) {
+    return { ...opp, ...existing };
+  }
+
+  const now = new Date().toISOString();
+  const base = {
+    sourceName: opp.sourceName || source?.name || "Unknown Source",
+    sourceUrl: opp.sourceUrl || source?.homepage || "",
+    projectUrl: opp.projectUrl || "",
+    applicationUrl: opp.applicationUrl || "",
+    verifiedAt: now,
+  };
+
+  if (opp.isDemo) {
+    const record = {
+      ...base,
+      verifiedUrl: "",
+      isVerified: false,
+      verificationStatus: "UNAVAILABLE",
+      verificationMessage: "Demo data is not a real client opportunity.",
+    };
+    verificationDb[key] = record;
+    await saveVerificationDb();
+    return { ...opp, ...record };
+  }
+
+  if (!source) {
+    const record = { ...base, ...verificationFields("UNVERIFIED", "", now), verificationMessage: "Unknown original source platform." };
+    verificationDb[key] = record;
+    await saveVerificationDb();
+    return { ...opp, ...record };
+  }
+
+  const candidates = [
+    ["applicationUrl", opp.applicationUrl],
+    ["projectUrl", opp.projectUrl],
+    ["sourceUrl", opp.sourceUrl],
+  ].filter(([, value]) => value);
+
+  for (const [field, candidate] of candidates) {
+    const parsed = isHttpUrl(candidate);
+    if (!parsed) continue;
+    if (!samePlatformHost(parsed.href, source)) continue;
+    const fetched = await fetchTextForVerification(parsed.href);
+    if (!fetched.ok) continue;
+    const finalUrl = fetched.finalUrl || parsed.href;
+    if (!samePlatformHost(finalUrl, source)) continue;
+    if (!confirmsOpportunity(fetched.text || "", finalUrl, opp)) continue;
+
+    const verifiedUrl = candidate;
+    const record = {
+      ...base,
+      verifiedUrl,
+      isVerified: true,
+      verifiedAt: now,
+      verificationStatus: "VERIFIED",
+      verificationMessage: `Verified via ${field} on ${source.name}.`,
+    };
+    verificationDb[key] = record;
+    await saveVerificationDb();
+    return { ...opp, ...record };
+  }
+
+  const hasAnyHttpUrl = candidates.some(([, value]) => isHttpUrl(value));
+  const expiredPreviouslyVerified = Boolean(existing?.isVerified);
+  const record = {
+    ...base,
+    verifiedUrl: "",
+    isVerified: false,
+    verifiedAt: now,
+    verificationStatus: expiredPreviouslyVerified ? "EXPIRED" : hasAnyHttpUrl ? "UNVERIFIED" : "UNAVAILABLE",
+    verificationMessage: expiredPreviouslyVerified
+      ? "Previously verified link expired and could not be re-verified."
+      : hasAnyHttpUrl
+        ? "Source link could not be verified on the original platform."
+        : "No real HTTP/HTTPS source URL was supplied by the connected source.",
+  };
+  verificationDb[key] = record;
+  await saveVerificationDb();
+  return { ...opp, ...record };
+}
+
+async function mapLimit(items, limit, mapper) {
+  const out = new Array(items.length);
+  let index = 0;
+  async function worker() {
+    while (index < items.length) {
+      const current = index++;
+      out[current] = await mapper(items[current], current);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+function sourceFields(source, projectUrl, applicationUrl = "") {
+  return {
+    sourceId: source.id,
+    sourceName: source.name.replace(/ \(.+\)/, ""),
+    sourceUrl: source.homepage,
+    projectUrl: projectUrl || "",
+    applicationUrl: applicationUrl || "",
+    ...verificationFields("UNVERIFIED"),
+  };
+}
+
 function normalizeRemoteOK(data) {
-  if (!Array.isArray(data)) return [];
+  const source = SOURCES.find((s) => s.id === "remoteok");
+  if (!Array.isArray(data) || !source) return [];
   return data
     .filter((row) => row && row.position && row.id && !row.legal)
     .slice(0, 80)
@@ -134,6 +365,7 @@ function normalizeRemoteOK(data) {
         row.salary || (row.salary_min && row.salary_max ? `${row.salary_min}-${row.salary_max}` : ""),
       );
       const desc = stripHtml(row.description || "");
+      const projectUrl = row.url || "";
       return {
         id: `remoteok-${row.id}`,
         title: row.position,
@@ -148,8 +380,7 @@ function normalizeRemoteOK(data) {
         location: row.location || "Remote",
         remote: true,
         postedAt: row.date || new Date((row.epoch || 0) * 1000).toISOString(),
-        sourceName: "RemoteOK",
-        sourceUrl: row.url || row.apply_url || `https://remoteok.com/remote-jobs/${row.id}`,
+        ...sourceFields(source, projectUrl, row.apply_url && samePlatformHost(row.apply_url, source) ? row.apply_url : ""),
         company: row.company,
         isDemo: false,
         tags: uniqueSkills(row.tags || []),
@@ -158,7 +389,9 @@ function normalizeRemoteOK(data) {
 }
 
 function normalizeRemotive(data) {
+  const source = SOURCES.find((s) => s.id === "remotive");
   const jobs = data?.jobs || [];
+  if (!source) return [];
   return jobs.slice(0, 80).map((row) => {
     const desc = stripHtml(row.description || "");
     const budget = parseBudget(row.salary);
@@ -176,8 +409,7 @@ function normalizeRemotive(data) {
       location: row.candidate_required_location || "Remote",
       remote: true,
       postedAt: row.publication_date,
-      sourceName: "Remotive",
-      sourceUrl: row.url,
+      ...sourceFields(source, row.url),
       company: row.company_name,
       isDemo: false,
       tags: uniqueSkills(row.tags || []),
@@ -186,7 +418,9 @@ function normalizeRemotive(data) {
 }
 
 function normalizeArbeitnow(data) {
+  const source = SOURCES.find((s) => s.id === "arbeitnow");
   const jobs = data?.data || [];
+  if (!source) return [];
   return jobs.slice(0, 80).map((row) => {
     const desc = stripHtml(row.description || "");
     return {
@@ -203,8 +437,7 @@ function normalizeArbeitnow(data) {
       location: row.location || (row.remote ? "Remote" : "Worldwide"),
       remote: Boolean(row.remote),
       postedAt: row.created_at,
-      sourceName: "Arbeitnow",
-      sourceUrl: row.url,
+      ...sourceFields(source, row.url),
       company: row.company_name,
       isDemo: false,
       tags: uniqueSkills(row.tags || []),
@@ -213,7 +446,9 @@ function normalizeArbeitnow(data) {
 }
 
 function normalizeJobicy(data) {
+  const source = SOURCES.find((s) => s.id === "jobicy");
   const jobs = data?.jobs || [];
+  if (!source) return [];
   return jobs.slice(0, 80).map((row) => {
     const desc = stripHtml(row.jobDescription || row.jobExcerpt || "");
     const budget = parseBudget(
@@ -233,8 +468,7 @@ function normalizeJobicy(data) {
       location: row.jobGeo || "Remote",
       remote: /remote|anywhere|worldwide/i.test(row.jobGeo || "remote"),
       postedAt: row.pubDate,
-      sourceName: "Jobicy",
-      sourceUrl: row.url,
+      ...sourceFields(source, row.url),
       company: row.companyName,
       isDemo: false,
       tags: uniqueSkills([row.jobType, row.jobLevel].filter(Boolean)),
@@ -243,7 +477,9 @@ function normalizeJobicy(data) {
 }
 
 function normalizeHimalayas(data) {
+  const source = SOURCES.find((s) => s.id === "himalayas");
   const jobs = data?.jobs || data?.data || (Array.isArray(data) ? data : []);
+  if (!source) return [];
   return jobs.slice(0, 80).map((row, i) => {
     const desc = stripHtml(row.description || row.excerpt || "");
     return {
@@ -260,8 +496,7 @@ function normalizeHimalayas(data) {
       location: (row.locationRestrictions || []).join(", ") || "Remote",
       remote: true,
       postedAt: row.pubDate || row.publishedDate || new Date().toISOString(),
-      sourceName: "Himalayas",
-      sourceUrl: row.applicationLink || row.url || row.guid || "https://himalayas.app/jobs",
+      ...sourceFields(source, samePlatformHost(row.url || row.guid, source) ? row.url || row.guid : "", row.applicationLink && samePlatformHost(row.applicationLink, source) ? row.applicationLink : ""),
       company: row.companyName,
       isDemo: false,
       tags: uniqueSkills(row.categories || []),
@@ -270,14 +505,16 @@ function normalizeHimalayas(data) {
 }
 
 function normalizeHN(data) {
+  const source = SOURCES.find((s) => s.id === "hn");
   const hits = data?.hits || [];
+  if (!source) return [];
   return hits
     .filter((h) => h.title || h.story_title || h.comment_text)
     .slice(0, 40)
     .map((h) => {
       const title = h.title || h.story_title || "HN freelance thread";
       const desc = stripHtml(h.comment_text || h.story_text || title);
-      const url = h.url || `https://news.ycombinator.com/item?id=${h.objectID}`;
+      const projectUrl = samePlatformHost(h.url, source) ? h.url : "";
       return {
         id: `hn-${h.objectID}`,
         title: title.replace(/^Ask HN:\s*/i, ""),
@@ -294,8 +531,7 @@ function normalizeHN(data) {
         location: "Remote · Worldwide",
         remote: true,
         postedAt: h.created_at,
-        sourceName: "Hacker News",
-        sourceUrl: url,
+        ...sourceFields(source, projectUrl),
         company: h.author,
         isDemo: false,
         tags: ["hn", "public-thread"],
@@ -342,7 +578,7 @@ function dedupe(items) {
   const out = [];
   for (const item of items) {
     const key = `${(item.title || "").toLowerCase().slice(0, 80)}|${(item.company || "").toLowerCase()}|${item.sourceName}`;
-    const urlKey = item.sourceUrl;
+    const urlKey = item.projectUrl || item.applicationUrl || item.sourceUrl;
     if (seen.has(key) || seen.has(urlKey)) continue;
     seen.add(key);
     seen.add(urlKey);
@@ -357,12 +593,14 @@ async function searchOpportunities(query) {
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.payload;
 
   const settled = await Promise.all(SOURCES.map((s) => loadSource(s, query)));
-  const results = dedupe(settled.flatMap((s) => s.items));
+  const unverifiedResults = dedupe(settled.flatMap((s) => s.items)).slice(0, MAX_VERIFIED_RESULTS);
+  const results = await mapLimit(unverifiedResults, 8, (item) => verifyOpportunityLink(item));
   const sources = settled.map((s) => ({
     id: s.source.id,
     name: s.source.name,
     ok: s.ok,
     count: s.items.length,
+    verifiedCount: results.filter((item) => item.sourceId === s.source.id && item.isVerified).length,
     message: s.message,
     url: s.source.homepage,
   }));
@@ -374,7 +612,7 @@ async function searchOpportunities(query) {
     results,
     fetchedAt: new Date().toISOString(),
     notice: liveConnected
-      ? undefined
+      ? "Real opportunities are marked only after their original platform link is verified. Unverified items cannot be applied to."
       : "Live opportunity sources are not connected yet.",
   };
   cache.set(cacheKey, { at: Date.now(), payload });
@@ -405,6 +643,29 @@ app.get("/api/search", async (req, res) => {
       notice: "Live opportunity sources are not connected yet.",
       error: err?.message || "Search failed",
     });
+  }
+});
+
+app.post("/api/opportunities/verify", async (req, res) => {
+  try {
+    const opportunity = req.body?.opportunity;
+    if (!opportunity?.id) {
+      res.status(400).json({ error: "Opportunity payload is required." });
+      return;
+    }
+    const verified = await verifyOpportunityLink(opportunity, { force: true });
+    for (const [key, value] of cache.entries()) {
+      cache.set(key, {
+        ...value,
+        payload: {
+          ...value.payload,
+          results: value.payload.results.map((item) => (item.id === verified.id ? { ...item, ...verified } : item)),
+        },
+      });
+    }
+    res.json({ opportunity: verified });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Verification failed" });
   }
 });
 

@@ -13,6 +13,7 @@ export type LeadStatus =
 export type AlertFrequency = "Instant" | "Daily" | "Weekly";
 export type SortKey = "best" | "newest" | "budget" | "competition";
 export type ProposalTone = "professional" | "short";
+export type VerificationStatus = "VERIFIED" | "UNVERIFIED" | "EXPIRED" | "UNAVAILABLE";
 
 export interface Opportunity {
   id: string;
@@ -28,8 +29,16 @@ export interface Opportunity {
   location: string;
   remote: boolean;
   postedAt: string;
+  sourceId?: string;
   sourceName: string;
   sourceUrl: string;
+  projectUrl?: string;
+  applicationUrl?: string;
+  verifiedUrl?: string;
+  isVerified: boolean;
+  verifiedAt?: string;
+  verificationStatus: VerificationStatus;
+  verificationMessage?: string;
   company?: string;
   isDemo: boolean;
   tags: string[];
@@ -132,6 +141,7 @@ export interface SourceStatus {
   name: string;
   ok: boolean;
   count: number;
+  verifiedCount?: number;
   message: string;
   url: string;
 }

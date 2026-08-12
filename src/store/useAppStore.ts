@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { DEMO_OPPORTUNITIES } from "@/data/demoOpportunities";
 import { applyFilters, rankOpportunities } from "@/lib/matching";
 import { generateProposal } from "@/lib/proposal";
-import { searchLive } from "@/lib/api";
+import { searchLive, verifyOpportunity } from "@/lib/api";
 import { loadJson, saveJson } from "@/lib/storage";
 import { uid } from "@/lib/format";
 import { expandQuery } from "@/data/skillGraph";
@@ -81,8 +81,9 @@ interface AppState {
   setFilters: (patch: Partial<SearchFilters>) => void;
   setQuery: (q: string) => void;
   runSearch: (q: string, smart?: boolean) => Promise<void>;
+  verifyLink: (opp: RankedOpportunity) => Promise<RankedOpportunity>;
   selectOpportunity: (opp?: RankedOpportunity) => void;
-  saveLead: (opp: RankedOpportunity) => Lead;
+  saveLead: (opp: RankedOpportunity) => Lead | undefined;
   updateLead: (id: string, patch: Partial<Lead>) => void;
   deleteLead: (id: string) => void;
   generateFor: (opp: RankedOpportunity, tone: ProposalTone, leadId?: string) => GeneratedProposal;
@@ -212,9 +213,32 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().checkAlerts();
   },
 
+  verifyLink: async (opp) => {
+    try {
+      const verified = await verifyOpportunity(opp);
+      const updated: RankedOpportunity = { ...opp, ...verified };
+      const rawResults = get().rawResults.map((item) => (item.id === updated.id ? { ...item, ...verified } : item));
+      const results = get().results.map((item) => (item.id === updated.id ? updated : item));
+      const leads = get().leads.map((lead) =>
+        lead.opportunity.id === updated.id ? { ...lead, opportunity: { ...lead.opportunity, ...verified }, updatedAt: new Date().toISOString() } : lead,
+      );
+      persist({ leads });
+      set({ rawResults, results, leads, selected: updated });
+      get().pushToast(updated.isVerified ? "Original link verified" : "Source link could not be verified");
+      return updated;
+    } catch {
+      get().pushToast("Verification failed. Try again later.");
+      return opp;
+    }
+  },
+
   selectOpportunity: (selected) => set({ selected }),
 
   saveLead: (opp) => {
+    if (!opp.isDemo && !opp.isVerified) {
+      get().pushToast("Verify the original source link before saving as a real lead");
+      return get().leads.find((l) => l.opportunity.id === opp.id);
+    }
     const existing = get().leads.find((l) => l.opportunity.id === opp.id);
     if (existing) {
       get().pushToast("Already saved in CRM");
